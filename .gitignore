@@ -4,6 +4,6 @@ server-secrets/
 *.zip
 token_*.json
 sub2api_*.json
-codex-sub2api-lite
+/codex-sub2api-lite
 dist/
 *.log
