@@ -11,8 +11,27 @@ import urllib.request
 import zipfile
 
 
-ACCOUNTS_DIR = os.environ.get("CS2API_ACCOUNTS_DIR", "/root/codex-sub2api/accounts")
 URL = "https://chatgpt.com/backend-api/wham/usage"
+
+
+def account_dirs():
+    candidates = []
+    env_dir = os.environ.get("CS2API_ACCOUNTS_DIR")
+    if env_dir:
+        candidates.append(env_dir)
+    home = os.path.expanduser("~")
+    candidates.extend([
+        "/root/codex-sub2api/accounts",
+        os.path.join(home, "codex-sub2api", "accounts"),
+        os.path.join(home, ".codex-sub2api", "accounts"),
+    ])
+    seen = set()
+    out = []
+    for path in candidates:
+        if path not in seen and os.path.isdir(path):
+            seen.add(path)
+            out.append(path)
+    return out
 
 
 def b64url_decode(text):
@@ -94,19 +113,31 @@ def load_sub2api_zip(path):
 
 def load_accounts():
     accounts = []
-    for path in sorted(glob.glob(os.path.join(ACCOUNTS_DIR, "*.json"))):
-        if path.endswith("-auth.json"):
-            item = load_auth_json(path)
-            if item:
-                accounts.append(item)
-    for path in sorted(glob.glob(os.path.join(ACCOUNTS_DIR, "*.zip"))):
-        accounts.extend(load_sub2api_zip(path))
+    for directory in account_dirs():
+        try:
+            json_paths = sorted(glob.glob(os.path.join(directory, "*.json")))
+            zip_paths = sorted(glob.glob(os.path.join(directory, "*.zip")))
+        except OSError:
+            continue
+        for path in json_paths:
+            if path.endswith("-auth.json"):
+                try:
+                    item = load_auth_json(path)
+                except (OSError, json.JSONDecodeError):
+                    item = None
+                if item:
+                    accounts.append(item)
+        for path in zip_paths:
+            try:
+                accounts.extend(load_sub2api_zip(path))
+            except (OSError, zipfile.BadZipFile, json.JSONDecodeError):
+                continue
     return accounts
 
 
 def proxy_handler():
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-    if not proxy and os.path.exists("/etc/systemd/system/codex-sub2api-lite.service"):
+    proxy = None
+    if os.path.exists("/etc/systemd/system/codex-sub2api-lite.service"):
         try:
             text = open("/etc/systemd/system/codex-sub2api-lite.service", encoding="utf-8").read()
             for line in text.splitlines():
@@ -117,6 +148,8 @@ def proxy_handler():
                     proxy = line.split("=", 2)[2].strip()
         except Exception:
             pass
+    if not proxy:
+        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
     if proxy:
         return urllib.request.ProxyHandler({"http": proxy, "https": proxy})
     return urllib.request.ProxyHandler({})
