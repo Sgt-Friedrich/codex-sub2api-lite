@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+import base64
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import zipfile
+
+
+ACCOUNTS_DIR = os.environ.get("CS2API_ACCOUNTS_DIR", "/root/codex-sub2api/accounts")
+URL = "https://chatgpt.com/backend-api/wham/usage"
+
+
+def b64url_decode(text):
+    text += "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode(text.encode("ascii"))
+
+
+def jwt_payload(token):
+    try:
+        return json.loads(b64url_decode(token.split(".")[1]))
+    except Exception:
+        return {}
+
+
+def redact_email(value):
+    if not value or "@" not in value:
+        return value or ""
+    local, domain = value.split("@", 1)
+    return (local[:2] + "***@" + domain) if len(local) > 2 else "***@" + domain
+
+
+def fmt_reset(seconds):
+    if seconds is None:
+        return "-"
+    try:
+        seconds = int(seconds)
+    except Exception:
+        return "-"
+    if seconds <= 0:
+        return "now"
+    h, rem = divmod(seconds, 3600)
+    m, _ = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m"
+
+
+def load_auth_json(path):
+    with open(path, "r", encoding="utf-8-sig") as f:
+        doc = json.load(f)
+    tokens = doc.get("tokens") or {}
+    access = tokens.get("access_token")
+    if not access:
+        return None
+    payload = jwt_payload(access)
+    return {
+        "source": os.path.basename(path),
+        "name": os.path.basename(path),
+        "access_token": access,
+        "account_id": tokens.get("account_id") or payload.get("https://api.openai.com/auth", {}).get("chatgpt_account_id"),
+        "email": payload.get("email") or "",
+    }
+
+
+def load_sub2api_zip(path):
+    with zipfile.ZipFile(path) as zf:
+        sub_name = next((n for n in zf.namelist() if os.path.basename(n).startswith("sub2api_") and n.endswith(".json")), None)
+        token_name = next((n for n in zf.namelist() if n.startswith("cpa/token_") and n.endswith(".json")), None)
+        if not sub_name:
+            return []
+        sub_doc = json.loads(zf.read(sub_name).decode("utf-8-sig"))
+        token_doc = json.loads(zf.read(token_name).decode("utf-8-sig")) if token_name else {}
+    out = []
+    for idx, item in enumerate(sub_doc.get("accounts") or []):
+        cred = item.get("credentials") or {}
+        access = cred.get("access_token") or token_doc.get("access_token")
+        if not access:
+            continue
+        payload = jwt_payload(access)
+        out.append({
+            "source": os.path.basename(path),
+            "name": item.get("name") or f"{os.path.basename(path)}:{idx}",
+            "access_token": access,
+            "account_id": cred.get("chatgpt_account_id") or token_doc.get("account_id"),
+            "email": token_doc.get("email") or payload.get("email") or item.get("name") or "",
+        })
+    return out
+
+
+def load_accounts():
+    accounts = []
+    for path in sorted(glob.glob(os.path.join(ACCOUNTS_DIR, "*.json"))):
+        if path.endswith("-auth.json"):
+            item = load_auth_json(path)
+            if item:
+                accounts.append(item)
+    for path in sorted(glob.glob(os.path.join(ACCOUNTS_DIR, "*.zip"))):
+        accounts.extend(load_sub2api_zip(path))
+    return accounts
+
+
+def proxy_handler():
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    if not proxy and os.path.exists("/etc/systemd/system/codex-sub2api-lite.service"):
+        try:
+            text = open("/etc/systemd/system/codex-sub2api-lite.service", encoding="utf-8").read()
+            for line in text.splitlines():
+                if line.startswith("Environment=HTTPS_PROXY="):
+                    proxy = line.split("=", 2)[2].strip()
+                    break
+                if line.startswith("Environment=HTTP_PROXY="):
+                    proxy = line.split("=", 2)[2].strip()
+        except Exception:
+            pass
+    if proxy:
+        return urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    return urllib.request.ProxyHandler({})
+
+
+def fetch_usage(account, opener):
+    req = urllib.request.Request(
+        URL,
+        headers={
+            "Authorization": "Bearer " + account["access_token"],
+            "Accept": "application/json",
+            "Originator": "codex_cli_rs",
+            "User-Agent": "codex_cli_rs/0.128.0",
+        },
+    )
+    if account.get("account_id"):
+        req.add_header("chatgpt-account-id", account["account_id"])
+    with opener.open(req, timeout=25) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def pct_left(window):
+    if not window:
+        return "-"
+    used = window.get("used_percent")
+    if used is None:
+        return "-"
+    try:
+        return f"{max(0, 100 - int(round(float(used))))}%"
+    except Exception:
+        return "-"
+
+
+def main():
+    accounts = load_accounts()
+    opener = urllib.request.build_opener(proxy_handler())
+    rows = []
+    for idx, acc in enumerate(accounts, 1):
+        try:
+            data = fetch_usage(acc, opener)
+            rl = data.get("rate_limit") or {}
+            p = rl.get("primary_window") or {}
+            s = rl.get("secondary_window") or {}
+            rows.append([
+                str(idx),
+                redact_email(data.get("email") or acc.get("email") or acc.get("name")),
+                data.get("plan_type") or "-",
+                "OK" if rl.get("allowed") else "LIMIT",
+                pct_left(p),
+                fmt_reset(p.get("reset_after_seconds")),
+                pct_left(s),
+                fmt_reset(s.get("reset_after_seconds")),
+                (data.get("rate_limit_reached_type") or {}).get("type") or "-",
+                acc["source"],
+            ])
+        except Exception as e:
+            rows.append([str(idx), redact_email(acc.get("email") or acc.get("name")), "-", "ERR", "-", "-", "-", "-", str(e)[:42], acc["source"]])
+    headers = ["#", "account", "plan", "state", "5h_left", "5h_reset", "week_left", "week_reset", "reason", "source"]
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+    print("  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)))
+    print("  ".join("-" * w for w in widths))
+    for row in rows:
+        print("  ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
+
+
+if __name__ == "__main__":
+    main()
