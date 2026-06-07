@@ -1,0 +1,27 @@
+[Unit]
+Description=codex-sub2api-lite
+After=network-online.target sing-box.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/codex-sub2api
+Environment=CS2API_LISTEN=127.0.0.1:8787
+Environment=CS2API_ACCOUNTS_DIR=/root/codex-sub2api/accounts
+Environment=HTTP_PROXY=http://127.0.0.1:7890
+Environment=HTTPS_PROXY=http://127.0.0.1:7890
+Environment=ALL_PROXY=http://127.0.0.1:7890
+Environment=NO_PROXY=127.0.0.1,localhost
+EnvironmentFile=-/root/codex-sub2api/env
+ExecStart=/root/codex-sub2api/codex-sub2api-lite
+Restart=on-failure
+RestartSec=3
+MemoryMax=50M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/root/codex-sub2api
+
+[Install]
+WantedBy=multi-user.target
