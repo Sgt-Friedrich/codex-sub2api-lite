@@ -3,8 +3,10 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -26,6 +28,8 @@ const (
 	defaultListen     = "127.0.0.1:8787"
 	defaultUpstream   = "https://chatgpt.com/backend-api/codex/responses"
 	defaultRefreshSec = 30
+	defaultStickyTTL  = 30 * time.Minute
+	defaultStickyMax  = 1024
 )
 
 type account struct {
@@ -38,7 +42,7 @@ type account struct {
 	ExpiresAt        int64
 	Models           []string
 	DisabledUntil    time.Time
-	LastError         string
+	LastError        string
 }
 
 type accountStore struct {
@@ -46,6 +50,14 @@ type accountStore struct {
 	mu       sync.RWMutex
 	accounts []account
 	next     atomic.Uint64
+	sticky   map[string]stickyBinding
+	ttl      time.Duration
+	maxKeys  int
+}
+
+type stickyBinding struct {
+	AccountID string
+	LastUsed  time.Time
 }
 
 type sub2APIFile struct {
@@ -73,7 +85,12 @@ func main() {
 	flag.IntVar(&refresh, "refresh-seconds", envInt("CS2API_REFRESH_SECONDS", defaultRefreshSec), "account directory refresh interval")
 	flag.Parse()
 
-	store := &accountStore{dir: dir}
+	store := &accountStore{
+		dir:     dir,
+		sticky:  map[string]stickyBinding{},
+		ttl:     time.Duration(envInt("CS2API_STICKY_TTL_SECONDS", int(defaultStickyTTL.Seconds()))) * time.Second,
+		maxKeys: envInt("CS2API_STICKY_MAX_KEYS", defaultStickyMax),
+	}
 	if err := store.reload(); err != nil {
 		log.Printf("initial account load failed: %v", err)
 	}
@@ -131,6 +148,7 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":            true,
 		"account_count": s.store.count(),
+		"sticky_count":  s.store.stickyCount(),
 		"rss_bytes":     currentRSS(),
 	})
 }
@@ -173,11 +191,12 @@ func (s *server) proxyResponses(w http.ResponseWriter, r *http.Request) {
 	if len(body) == 0 {
 		body = []byte(`{}`)
 	}
+	sessionKey := sessionKeyFromBody(body, r)
 	body = normalizeResponsesBody(body, isCompact(r.URL.Path))
 
 	var lastErr string
 	for attempt := 0; attempt < s.store.count(); attempt++ {
-		acc, ok := s.store.pick()
+		acc, ok := s.store.pick(sessionKey)
 		if !ok {
 			break
 		}
@@ -187,7 +206,7 @@ func (s *server) proxyResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		lastErr = err.Error()
 		if retryable {
-			s.store.markFailure(acc.ID, lastErr, status)
+			s.store.markFailure(acc.ID, sessionKey, lastErr, status)
 			continue
 		}
 		http.Error(w, lastErr, status)
@@ -294,26 +313,37 @@ func (st *accountStore) count() int {
 	return len(st.accounts)
 }
 
-func (st *accountStore) pick() (account, bool) {
-	st.mu.RLock()
-	defer st.mu.RUnlock()
+func (st *accountStore) pick(sessionKey string) (account, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	now := time.Now()
 	n := len(st.accounts)
 	if n == 0 {
 		return account{}, false
 	}
+	st.cleanupStickyLocked(now)
+	if sessionKey != "" {
+		if binding, ok := st.sticky[sessionKey]; ok && now.Sub(binding.LastUsed) <= st.ttl {
+			if a, ok := st.accountByIDLocked(binding.AccountID, now); ok {
+				st.sticky[sessionKey] = stickyBinding{AccountID: a.ID, LastUsed: now}
+				return a, true
+			}
+			delete(st.sticky, sessionKey)
+		}
+	}
 	start := int(st.next.Add(1) % uint64(n))
 	for i := 0; i < n; i++ {
 		a := st.accounts[(start+i)%n]
-		if a.AccessToken == "" || (a.ExpiresAt > 0 && a.ExpiresAt <= now.Unix()) || now.Before(a.DisabledUntil) {
+		if !accountAvailable(a, now) {
 			continue
 		}
+		st.bindStickyLocked(sessionKey, a.ID, now)
 		return a, true
 	}
 	return account{}, false
 }
 
-func (st *accountStore) markFailure(id, msg string, status int) {
+func (st *accountStore) markFailure(id, sessionKey, msg string, status int) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	backoff := 30 * time.Second
@@ -326,8 +356,68 @@ func (st *accountStore) markFailure(id, msg string, status int) {
 		if st.accounts[i].ID == id {
 			st.accounts[i].LastError = msg
 			st.accounts[i].DisabledUntil = time.Now().Add(backoff)
+			if sessionKey != "" {
+				delete(st.sticky, sessionKey)
+			}
 			return
 		}
+	}
+}
+
+func (st *accountStore) stickyCount() int {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	return len(st.sticky)
+}
+
+func (st *accountStore) accountByIDLocked(id string, now time.Time) (account, bool) {
+	for _, a := range st.accounts {
+		if a.ID == id && accountAvailable(a, now) {
+			return a, true
+		}
+	}
+	return account{}, false
+}
+
+func accountAvailable(a account, now time.Time) bool {
+	return a.AccessToken != "" && (a.ExpiresAt == 0 || a.ExpiresAt > now.Unix()) && !now.Before(a.DisabledUntil)
+}
+
+func (st *accountStore) bindStickyLocked(sessionKey, accountID string, now time.Time) {
+	if sessionKey == "" {
+		return
+	}
+	if st.sticky == nil {
+		st.sticky = map[string]stickyBinding{}
+	}
+	if st.maxKeys > 0 && len(st.sticky) >= st.maxKeys {
+		st.evictOldestStickyLocked()
+	}
+	st.sticky[sessionKey] = stickyBinding{AccountID: accountID, LastUsed: now}
+}
+
+func (st *accountStore) cleanupStickyLocked(now time.Time) {
+	if st.ttl <= 0 {
+		return
+	}
+	for key, binding := range st.sticky {
+		if now.Sub(binding.LastUsed) > st.ttl {
+			delete(st.sticky, key)
+		}
+	}
+}
+
+func (st *accountStore) evictOldestStickyLocked() {
+	var oldestKey string
+	var oldestTime time.Time
+	for key, binding := range st.sticky {
+		if oldestKey == "" || binding.LastUsed.Before(oldestTime) {
+			oldestKey = key
+			oldestTime = binding.LastUsed
+		}
+	}
+	if oldestKey != "" {
+		delete(st.sticky, oldestKey)
 	}
 }
 
@@ -509,6 +599,34 @@ func parseSub2API(raw []byte, source string, tokenRaw []byte) []account {
 		})
 	}
 	return out
+}
+
+func sessionKeyFromBody(raw []byte, r *http.Request) string {
+	if header := r.Header.Get("X-Codex-Session-Id"); header != "" {
+		return "header:" + hashKey(header)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return "default"
+	}
+	for _, key := range []string{"previous_response_id", "prompt_cache_key", "conversation_id", "thread_id", "session_id"} {
+		if value, ok := body[key].(string); ok && value != "" {
+			return key + ":" + hashKey(value)
+		}
+	}
+	if metadata, ok := body["metadata"].(map[string]any); ok {
+		for _, key := range []string{"codex_session_id", "session_id", "thread_id", "conversation_id"} {
+			if value, ok := metadata[key].(string); ok && value != "" {
+				return "metadata." + key + ":" + hashKey(value)
+			}
+		}
+	}
+	return "default"
+}
+
+func hashKey(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:8])
 }
 
 func normalizeResponsesBody(raw []byte, compact bool) []byte {
