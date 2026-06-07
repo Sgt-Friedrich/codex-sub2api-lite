@@ -1,6 +1,7 @@
 accounts/
 server-config/
 server-secrets/
+deploy-secrets/
 *.zip
 token_*.json
 sub2api_*.json

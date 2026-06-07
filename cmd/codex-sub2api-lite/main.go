@@ -390,19 +390,53 @@ func loadAccounts(dir string) ([]account, error) {
 			}
 			out = append(out, items...)
 		case ".json":
-			if !strings.HasPrefix(e.Name(), "sub2api_") {
-				continue
-			}
 			raw, err := os.ReadFile(path)
 			if err != nil {
 				log.Printf("skip %s: %v", path, err)
 				continue
 			}
-			out = append(out, parseSub2API(raw, path, nil)...)
+			if strings.HasPrefix(e.Name(), "sub2api_") {
+				out = append(out, parseSub2API(raw, path, nil)...)
+			} else if strings.HasSuffix(e.Name(), "-auth.json") {
+				if acc, ok := parseCodexAuth(raw, path); ok {
+					out = append(out, acc)
+				}
+			}
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
+}
+
+type codexAuthFile struct {
+	AuthMode string `json:"auth_mode"`
+	Tokens   struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		AccountID    string `json:"account_id"`
+	} `json:"tokens"`
+	LastRefresh string `json:"last_refresh"`
+}
+
+func parseCodexAuth(raw []byte, source string) (account, bool) {
+	var doc codexAuthFile
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		log.Printf("parse %s failed: %v", source, err)
+		return account{}, false
+	}
+	if strings.ToLower(doc.AuthMode) != "chatgpt" || doc.Tokens.AccessToken == "" {
+		return account{}, false
+	}
+	return account{
+		ID:               filepath.Base(source),
+		Name:             filepath.Base(source),
+		Source:           source,
+		AccessToken:      doc.Tokens.AccessToken,
+		RefreshToken:     doc.Tokens.RefreshToken,
+		ChatGPTAccountID: doc.Tokens.AccountID,
+		ExpiresAt:        jwtExp(doc.Tokens.AccessToken),
+		Models:           defaultModels(),
+	}, true
 }
 
 func loadZip(path string) ([]account, error) {
@@ -635,6 +669,10 @@ func modelsFrom(values ...any) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func defaultModels() []string {
+	return []string{"gpt-5.2", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5"}
 }
 
 func jwtExp(token string) int64 {
