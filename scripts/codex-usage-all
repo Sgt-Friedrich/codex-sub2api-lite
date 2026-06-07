@@ -173,40 +173,71 @@ def fetch_usage(account, opener):
 
 def pct_left(window):
     if not window:
-        return "-"
+        return None
     used = window.get("used_percent")
     if used is None:
-        return "-"
+        return None
     try:
-        return f"{max(0, 100 - int(round(float(used))))}%"
+        return max(0, 100 - int(round(float(used))))
     except Exception:
+        return None
+
+
+def fmt_pct(value):
+    if value is None:
         return "-"
+    return f"{int(round(value))}%"
+
+
+def avg(values):
+    values = [v for v in values if v is not None]
+    if not values:
+        return None
+    return sum(values) / len(values)
 
 
 def main():
     accounts = load_accounts()
     opener = urllib.request.build_opener(proxy_handler())
     rows = []
+    five_hour_left = []
+    week_left = []
+    states = {"OK": 0, "LIMIT": 0, "ERR": 0}
     for idx, acc in enumerate(accounts, 1):
         try:
             data = fetch_usage(acc, opener)
             rl = data.get("rate_limit") or {}
             p = rl.get("primary_window") or {}
             s = rl.get("secondary_window") or {}
+            state = "OK" if rl.get("allowed") else "LIMIT"
+            states[state] += 1
+            p_left = pct_left(p)
+            s_left = pct_left(s)
+            five_hour_left.append(p_left)
+            week_left.append(s_left)
             rows.append([
                 str(idx),
                 redact_email(data.get("email") or acc.get("email") or acc.get("name")),
                 data.get("plan_type") or "-",
-                "OK" if rl.get("allowed") else "LIMIT",
-                pct_left(p),
+                state,
+                fmt_pct(p_left),
                 fmt_reset(p.get("reset_after_seconds")),
-                pct_left(s),
+                fmt_pct(s_left),
                 fmt_reset(s.get("reset_after_seconds")),
                 (data.get("rate_limit_reached_type") or {}).get("type") or "-",
                 acc["source"],
             ])
         except Exception as e:
+            states["ERR"] += 1
             rows.append([str(idx), redact_email(acc.get("email") or acc.get("name")), "-", "ERR", "-", "-", "-", "-", str(e)[:42], acc["source"]])
+    print(
+        "summary: "
+        f"accounts={len(accounts)} ok={states['OK']} limit={states['LIMIT']} err={states['ERR']} "
+        f"approx_5h_left={fmt_pct(avg(five_hour_left))} "
+        f"approx_week_left={fmt_pct(avg(week_left))}"
+    )
+    print("note: totals are equal-weight averages because the upstream exposes percentages, not absolute per-account caps.")
+    print()
     headers = ["#", "account", "plan", "state", "5h_left", "5h_reset", "week_left", "week_reset", "reason", "source"]
     widths = [len(h) for h in headers]
     for row in rows:
